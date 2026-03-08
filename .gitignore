@@ -1,0 +1,18 @@
+# Environment files
+.env
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.mdb
+
+# Checkpoint files
+*.ckpt
+.langgraph_api/
+venv/
+gangubai_chatbot.ipynb
+simple_rag.py
+.gangubai_db_hf/
+
+__pycahce__/
