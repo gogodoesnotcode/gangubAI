@@ -1,7 +1,7 @@
 {
   "dependencies": ["."],
   "graphs": {
-    "agent": "gangubAI_chatbot:agent"
+    "agent": "ai.chatbot.graph:agent"
   },
   "env": ".env"
 }

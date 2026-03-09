@@ -15,4 +15,10 @@ gangubai_chatbot.ipynb
 simple_rag.py
 .gangubai_db_hf/
 
-__pycahce__/
+__pycache__/
+*.pyc
+
+# ROS 2 build artifacts
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
