@@ -10,7 +10,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import BaseModel, Field
 
 from ai.chatbot.config import MODEL_ID, SYSTEM_PROMPT
-from ai.chatbot.tools import calculator, retrieve_context
+from ai.chatbot.tools import calculator, retrieve_context, move_robot
 
 
 # ── State schema ───────────────────────────────────────────
@@ -29,7 +29,7 @@ class RAGResponse(BaseModel):
 
 
 # ── LLM bindings ──────────────────────────────────────────
-tools_list = [calculator, retrieve_context]
+tools_list = [calculator, retrieve_context, move_robot]
 model = init_chat_model(MODEL_ID)
 llm_with_tools = model.bind_tools(tools_list)
 llm_for_rag = model.with_structured_output(RAGResponse)
