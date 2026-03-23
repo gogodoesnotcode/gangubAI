@@ -41,6 +41,18 @@ def generate_launch_description():
         'params_file', default_value=default_params,
         description='Path to motor controller parameter file',
     )
+    wander_cliff_arg = DeclareLaunchArgument(
+        'wander_require_cliff_data', default_value='true',
+        description='Require cliff sensor data in wander mode for safety',
+    )
+    wander_cliff_type_arg = DeclareLaunchArgument(
+        'wander_cliff_message_type', default_value='scan',
+        description='Cliff message type for wander controller: range or scan',
+    )
+    wander_cliff_topic_arg = DeclareLaunchArgument(
+        'wander_cliff_topic', default_value='cliff_scan',
+        description='Cliff topic for wander controller',
+    )
 
     # ── Gazebo (only when simulate:=true) ────────────────────────────
     gazebo = IncludeLaunchDescription(
@@ -84,12 +96,31 @@ def generate_launch_description():
         ],
     )
 
+    # ── Wander controller node (idles until /wander_mode=start) ─────
+    wander_controller = Node(
+        package='gangubai_control',
+        executable='wander_controller',
+        name='wander_controller',
+        output='screen',
+        parameters=[
+            {
+                'require_cliff_data': LaunchConfiguration('wander_require_cliff_data'),
+                'cliff_message_type': LaunchConfiguration('wander_cliff_message_type'),
+                'cliff_topic': LaunchConfiguration('wander_cliff_topic'),
+            },
+        ],
+    )
+
     return LaunchDescription([
         simulate_arg,
         demo_arg,
         params_arg,
+        wander_cliff_arg,
+        wander_cliff_type_arg,
+        wander_cliff_topic_arg,
         gazebo,
         robot_state_publisher,
         spawn_entity,
         motor_controller,
+        wander_controller,
     ])

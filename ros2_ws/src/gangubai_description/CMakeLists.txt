@@ -5,10 +5,17 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# Install launch files and URDFs to the share directory
-install(DIRECTORY launch urdf
+# Install URDF assets to the share directory.
+install(DIRECTORY urdf
   DESTINATION share/${PROJECT_NAME}
 )
+
+# Some checkouts do not include a launch directory yet.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launch")
+  install(DIRECTORY launch
+    DESTINATION share/${PROJECT_NAME}
+  )
+endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 # uncomment the following section in order to fill in

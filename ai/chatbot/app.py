@@ -34,13 +34,17 @@ def main():
             print("\n💭 GangubAI is thinking...\n")
 
             # Stream the response
+            final_state = None
             for event in chatbot.stream(
                 {"messages": [HumanMessage(content=user_query)]},
                 config=config,
                 stream_mode="values",
             ):
                 event["messages"][-1].pretty_print()
+                final_state = event
 
+            emotion = (final_state or {}).get("current_emotion", "neutral")
+            print(f"\n🎭 Emotion: {emotion}")
             print("=" * 60)
 
         except KeyboardInterrupt:

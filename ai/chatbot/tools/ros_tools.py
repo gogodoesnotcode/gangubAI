@@ -10,20 +10,30 @@ from langchain_core.tools import tool
 import subprocess
 
 VALID_DIRECTIONS = ("forward", "backward", "left", "right", "stop")
+VALID_WANDER_ACTIONS = ("start", "stop")
+
+
+def _publish_once(topic: str, message_type: str, payload: str) -> None:
+    """Publish one ROS message by shelling out to `ros2 topic pub --once`."""
+    subprocess.Popen(
+        [
+            "ros2", "topic", "pub", "--once",
+            topic, message_type,
+            payload,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def _publish_motor_command(direction: str, duration: float = 5.0) -> str:
     """Publish a string command to /motor_command and auto-stop after *duration* seconds."""
     try:
         # Send the movement command
-        subprocess.Popen(
-            [
-                "ros2", "topic", "pub", "--once",
-                "/motor_command", "std_msgs/msg/String",
-                f"{{data: '{direction}'}}",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        _publish_once(
+            topic="/motor_command",
+            message_type="std_msgs/msg/String",
+            payload=f"{{data: '{direction}'}}",
         )
 
         # If the command is "stop" we're done — no need to schedule another stop
@@ -85,3 +95,39 @@ def move_robot(
                 f"Valid options: forward, backward, left, right, 360, stop.")
 
     return _publish_motor_command(direction, duration)
+
+
+@tool
+def set_wander_mode(action: Literal["start", "stop"]) -> str:
+    """Start or stop autonomous wander behavior.
+
+    Use this tool when the user asks the robot to wander/explore autonomously,
+    or to stop wandering and return to idle.
+
+    Args:
+        action: "start" to enter wander mode, "stop" to return to idle.
+
+    Returns:
+        A status message confirming the mode change.
+    """
+    action = action.strip().lower()
+
+    if action not in VALID_WANDER_ACTIONS:
+        return f"Invalid wander action '{action}'. Use start or stop."
+
+    try:
+        _publish_once(
+            topic="/wander_mode",
+            message_type="std_msgs/msg/String",
+            payload=f"{{data: '{action}'}}",
+        )
+        if action == "start":
+            return "Wander mode enabled. Robot will move autonomously until stopped."
+        return "Wander mode stopped. Robot returned to idle."
+    except FileNotFoundError:
+        return (
+            "Error: `ros2` command not found. "
+            "Make sure ROS 2 is sourced (source /opt/ros/humble/setup.bash)."
+        )
+    except Exception as e:
+        return f"Error changing wander mode: {e}"
