@@ -18,6 +18,11 @@ MAX_RECORD_TIME_S: float = 30.0
 # (lets the wake-word sound die out so it isn't captured).
 PRE_RECORD_DELAY_S: float = 0.4
 
+# Use ALSA aplay for TTS output (instead of PortAudio/sounddevice).
+# Enable on Raspberry Pi with I2S amplifiers (e.g., MAX98357A) where the recorder
+# holds ALSA open. When True, the script auto-detects the ALSA device.
+TTS_USE_APLAY: bool = True
+
 # Temporary file used for the recorded audio.
 RECORDING_OUTPUT_FILE: str = "gangubai_input.wav"
 
@@ -85,4 +90,4 @@ TTS_STREAM_BLOCKSIZE: int = 8192
 TTS_QUEUE_CHUNK_CHARS: int = 700
 
 # Small silence tail (seconds) appended to each spoken chunk to avoid clipped endings.
-TTS_TAIL_SILENCE_S: float = 0.2
+TTS_TAIL_SILENCE_S: float = 0.01

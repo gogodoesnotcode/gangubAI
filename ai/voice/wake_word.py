@@ -126,6 +126,32 @@ class WakeWordDetector:
         except Exception as exc:
             errors.append(f"wakeword_model_paths API failed: {exc}")
 
+        # Older OpenWakeWord API variants (e.g. versions that don't accept
+        # feature-model kwargs) can still work with minimal arguments.
+        try:
+            self._oww_model = Model(
+                wakeword_model_paths=[str(model_path)],
+            )
+            print(
+                f"[WakeWord] Loaded wake-word model: {model_path} (wakeword_model_paths minimal).",
+                flush=True,
+            )
+            return
+        except Exception as exc:
+            errors.append(f"wakeword_model_paths minimal API failed: {exc}")
+
+        try:
+            self._oww_model = Model(
+                wakeword_models=[str(model_path)],
+            )
+            print(
+                f"[WakeWord] Loaded wake-word model: {model_path} (wakeword_models minimal).",
+                flush=True,
+            )
+            return
+        except Exception as exc:
+            errors.append(f"wakeword_models minimal API failed: {exc}")
+
         print(
             "[WakeWord] Failed loading model with available APIs; "
             f"details: {' | '.join(errors)}. Falling back to keyboard PTT.",

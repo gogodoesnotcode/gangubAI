@@ -1,0 +1,38 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="cliff_test">
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <model name="test_table">
+      <static>true</static>
+      <pose>0 0 0.4 0 0 0</pose>
+      <link name="table_link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>1.6 1.0 0.8</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>1.6 1.0 0.8</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.74 0.53 0.32 1</ambient>
+            <diffuse>0.74 0.53 0.32 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>

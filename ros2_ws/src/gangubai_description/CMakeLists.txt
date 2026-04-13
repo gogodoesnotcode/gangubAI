@@ -10,6 +10,10 @@ install(DIRECTORY urdf
   DESTINATION share/${PROJECT_NAME}
 )
 
+install(DIRECTORY worlds
+  DESTINATION share/${PROJECT_NAME}
+)
+
 # Some checkouts do not include a launch directory yet.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launch")
   install(DIRECTORY launch

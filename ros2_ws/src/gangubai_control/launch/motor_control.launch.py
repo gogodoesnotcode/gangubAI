@@ -14,15 +14,24 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
+
+try:
+    from ament_index_python.packages import get_package_share_directory as _gpsd
+    _gpsd('gazebo_ros')
+    GAZEBO_AVAILABLE = True
+except Exception:
+    GAZEBO_AVAILABLE = False
 
 
 def generate_launch_description():
     pkg_control = get_package_share_directory('gangubai_control')
     pkg_description = get_package_share_directory('gangubai_description')
     default_params = os.path.join(pkg_control, 'config', 'motor_params.yaml')
+    default_world = os.path.join(pkg_description, 'worlds', 'cliff_test.world')
 
     # Read URDF for robot_state_publisher
     urdf_file = os.path.join(pkg_description, 'urdf', 'gangubai.urdf')
@@ -41,6 +50,10 @@ def generate_launch_description():
         'params_file', default_value=default_params,
         description='Path to motor controller parameter file',
     )
+    world_arg = DeclareLaunchArgument(
+        'world', default_value=default_world,
+        description='Gazebo world file to load',
+    )
     wander_cliff_arg = DeclareLaunchArgument(
         'wander_require_cliff_data', default_value='true',
         description='Require cliff sensor data in wander mode for safety',
@@ -55,13 +68,20 @@ def generate_launch_description():
     )
 
     # ── Gazebo (only when simulate:=true) ────────────────────────────
-    gazebo = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(get_package_share_directory('gazebo_ros'),
-                         'launch', 'gazebo.launch.py')
-        ),
-        condition=IfCondition(LaunchConfiguration('simulate')),
-    )
+    if GAZEBO_AVAILABLE:
+        gazebo = IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                PathJoinSubstitution([
+                    FindPackageShare('gazebo_ros'),
+                    'launch',
+                    'gazebo.launch.py',
+                ])
+            ),
+            launch_arguments={'world': LaunchConfiguration('world')}.items(),
+            condition=IfCondition(LaunchConfiguration('simulate')),
+        )
+    else:
+        gazebo = None
 
     robot_state_publisher = Node(
         package='robot_state_publisher',
@@ -71,15 +91,18 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('simulate')),
     )
 
-    spawn_entity = Node(
-        package='gazebo_ros',
-        executable='spawn_entity.py',
-        arguments=['-topic', 'robot_description',
-                   '-entity', 'gangubai',
-                   '-x', '0.0', '-y', '0.0', '-z', '1.0'],
-        output='screen',
-        condition=IfCondition(LaunchConfiguration('simulate')),
-    )
+    if GAZEBO_AVAILABLE:
+        spawn_entity = Node(
+            package='gazebo_ros',
+            executable='spawn_entity.py',
+            arguments=['-topic', 'robot_description',
+                       '-entity', 'gangubai',
+                       '-x', '0.0', '-y', '0.0', '-z', '1.0'],
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('simulate')),
+        )
+    else:
+        spawn_entity = None
 
     # ── Motor controller node ────────────────────────────────────────
     motor_controller = Node(
@@ -111,16 +134,15 @@ def generate_launch_description():
         ],
     )
 
-    return LaunchDescription([
-        simulate_arg,
-        demo_arg,
-        params_arg,
-        wander_cliff_arg,
-        wander_cliff_type_arg,
-        wander_cliff_topic_arg,
-        gazebo,
-        robot_state_publisher,
-        spawn_entity,
-        motor_controller,
-        wander_controller,
-    ])
+    actions = [
+        simulate_arg, demo_arg, params_arg, world_arg,
+        wander_cliff_arg, wander_cliff_type_arg, wander_cliff_topic_arg,
+        motor_controller, wander_controller,
+    ]
+    if gazebo:
+        actions.append(gazebo)
+    if robot_state_publisher:
+        actions.append(robot_state_publisher)
+    if spawn_entity:
+        actions.append(spawn_entity)
+    return LaunchDescription(actions)

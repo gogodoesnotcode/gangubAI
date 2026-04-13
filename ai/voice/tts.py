@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import queue
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -31,6 +32,52 @@ from ai.voice import config
 _SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _SANITIZE_RE = re.compile(r"[^\w\s,.!?:;'\-]")
 _MAX_SENTENCE_CHARS = 220
+_CACHED_ALSA_DEVICE: str | None = None
+
+
+
+def _find_alsa_device() -> str:
+    """Detect the best ALSA device name for aplay.
+    
+    Returns the device in order of preference:
+    1. 'default' (safe choice with automatic handling)
+    2. plughw for MAX98357A (if default not available)
+    3. sysdefault (system default)
+    4. Fallback if nothing else available
+    
+    Prefers 'default' for maximum compatibility and robustness.
+    The conversion from S16_LE mono to S32_LE stereo is handled separately.
+    """
+    global _CACHED_ALSA_DEVICE
+    if _CACHED_ALSA_DEVICE is not None:
+        return _CACHED_ALSA_DEVICE
+    
+    print("[TTS] Using ALSA default device (recommended for maximum compatibility)", flush=True)
+    _CACHED_ALSA_DEVICE = "default"
+    return "default"
+
+
+
+def _convert_s16_to_s32_stereo(s16_data: bytes) -> bytes:
+    """Convert mono S16_LE audio to stereo S32_LE format for MAX98357A.
+    
+    The MAX98357A I2S amplifier requires:
+    - S32_LE format (not S16_LE)
+    - Stereo output (not mono)
+    
+    This function converts Piper's S16_LE mono output to the required format.
+    """
+    # Interpret bytes as 16-bit signed integers
+    s16_array = np.frombuffer(s16_data, dtype=np.int16)
+    
+    # Convert to 32-bit (left-shift by 16 bits to use upper bits of 32-bit word)
+    s32_array = s16_array.astype(np.int32) << 16
+    
+    # Duplicate each sample for stereo (L, R, L, R, ...)
+    stereo_array = np.repeat(s32_array, 2)
+    
+    # Convert back to bytes
+    return stereo_array.tobytes()
 
 
 def _sanitize_text_for_tts(text: str) -> str:
@@ -92,6 +139,109 @@ def _resolve_output_device_rate(output_device: str | int | None) -> int:
         return 48000
 
 
+def _resolve_output_device(output_device: str | int | None) -> str | int | None:
+    """Return a valid output device or None to use system default.
+
+    Device indices can change across sessions/processes (e.g. USB reconnects),
+    so a previously working index may later be invalid.
+    """
+    print(f"[TTS DEBUG] All devices: {[(i, d['name'], d['max_output_channels']) for i, d in enumerate(sd.query_devices())]}", flush=True)
+    try:
+        for idx, dev in enumerate(sd.query_devices()):
+            if "MAX98357A" in str(dev.get("name", "")) and int(dev.get("max_output_channels", 0)) > 0:
+                print(f"[TTS] Found I2S amp at runtime index: {idx}", flush=True)
+                return idx
+    except Exception:
+        pass
+    if output_device is None:
+        return None
+
+    # Normalize accidental whitespace from config/env edits.
+    if isinstance(output_device, str):
+        output_device = output_device.strip()
+        if not output_device:
+            return None
+
+        # Resolve by explicit output-device list first. This is more reliable
+        # than passing a string to query_devices(..., kind="output") across
+        # different runtime contexts/host APIs.
+        try:
+            all_devices = sd.query_devices()
+            for idx, dev in enumerate(all_devices):
+                try:
+                    name = str(dev.get("name", ""))
+                    out_ch = int(dev.get("max_output_channels", 0))
+                except Exception:
+                    continue
+                if out_ch <= 0:
+                    continue
+
+                # Exact, case-insensitive match.
+                if name.strip().lower() == output_device.lower():
+                    return idx
+
+            # Substring fallback for user convenience.
+            for idx, dev in enumerate(all_devices):
+                try:
+                    name = str(dev.get("name", ""))
+                    out_ch = int(dev.get("max_output_channels", 0))
+                except Exception:
+                    continue
+                if out_ch <= 0:
+                    continue
+                if output_device.lower() in name.lower():
+                    return idx
+        except Exception:
+            pass
+
+    try:
+        sd.query_devices(device=output_device, kind="output")
+        return output_device
+    except Exception as exc:
+        print(
+            f"[TTS] Output device {output_device!r} unavailable: {exc}. "
+            "Trying fallback output selection.",
+            flush=True,
+        )
+
+    # Fallback 1: use sounddevice default output index if available.
+    try:
+        default_in_out = sd.default.device
+        default_out = None
+        if isinstance(default_in_out, (list, tuple)) and len(default_in_out) >= 2:
+            default_out = default_in_out[1]
+        elif isinstance(default_in_out, int):
+            default_out = default_in_out
+
+        if isinstance(default_out, int) and default_out >= 0:
+            sd.query_devices(device=default_out, kind="output")
+            print(f"[TTS] Using default output device index: {default_out}", flush=True)
+            return default_out
+    except Exception:
+        pass
+
+    # Fallback 2: pick first output-capable concrete device.
+    try:
+        for idx, dev in enumerate(sd.query_devices()):
+            try:
+                out_ch = int(dev.get("max_output_channels", 0))
+            except Exception:
+                continue
+            if out_ch <= 0:
+                continue
+            try:
+                sd.query_devices(device=idx, kind="output")
+                name = str(dev.get("name", "unknown"))
+                print(f"[TTS] Using fallback output device {idx}: {name}", flush=True)
+                return idx
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    print("[TTS] No valid output device found; using system default (may fail).", flush=True)
+    return None
+
 def speak(
     text: str,
     interrupted_flag: threading.Event | None = None,
@@ -104,12 +254,6 @@ def speak(
     stream_blocksize: int = config.TTS_STREAM_BLOCKSIZE,
     tail_silence_s: float = config.TTS_TAIL_SILENCE_S,
 ) -> None:
-    """Synthesize and play *text* with Piper + sounddevice.
-
-    Raises:
-        FileNotFoundError: if the Piper binary or model is missing.
-        RuntimeError: if Piper fails or audio playback fails.
-    """
     utterance = _sanitize_text_for_tts(text)
     if not utterance:
         return
@@ -132,7 +276,7 @@ def speak(
         [str(bin_path), "--model", str(model_path), "--output-raw"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
     )
 
     try:
@@ -140,52 +284,222 @@ def speak(
         proc.stdin.write(utterance.encode("utf-8") + b"\n")
         proc.stdin.close()
 
-        native_rate = _resolve_output_device_rate(output_device)
-        use_native_rate = False
-        try:
-            sd.check_output_settings(
-                device=output_device,
-                samplerate=piper_rate,
-                channels=1,
-                dtype="int16",
+        # --- Direct aplay path: bypasses PortAudio entirely ---
+        # Use this when the recorder holds ALSA open and PortAudio
+        # cannot enumerate the I2S output device.
+        if getattr(config, "TTS_USE_APLAY", False):
+            print("[TTS] Using direct aplay output.", flush=True)
+            alsa_device = _find_alsa_device()
+            aplay = subprocess.Popen(
+                [
+                    "aplay", "-q",
+                    "-D", alsa_device,
+                    "-f", "S32_LE",    # MAX98357A requires S32_LE, not S16_LE
+                    "-r", str(piper_rate),
+                    "-c", "2",         # MAX98357A requires stereo, not mono
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
-        except Exception:
-            use_native_rate = True
+            try:
+                assert aplay.stdin is not None
+                assert proc.stdout is not None
+                bytes_written = 0
+                try:
+                    while True:
+                        if interrupted_flag and interrupted_flag.is_set():
+                            break
+                        raw = proc.stdout.read(read_chunk_bytes)
+                        if not raw:
+                            break
+                        # Convert S16_LE mono (from Piper) to S32_LE stereo (for MAX98357A)
+                        converted = _convert_s16_to_s32_stereo(raw)
+                        aplay.stdin.write(converted)
+                        aplay.stdin.flush()
+                        bytes_written += len(converted)
+                except BrokenPipeError as e:
+                    print(f"[TTS] Broken pipe after writing {bytes_written} bytes: {e}", flush=True)
+                    err = b""
+                    if aplay.stderr is not None:
+                        err = aplay.stderr.read()
+                    msg = err.decode("utf-8", errors="ignore").strip()
+                    raise RuntimeError(f"aplay pipe closed: {msg or 'no stderr'}") from e
+                aplay.stdin.close()
+                rc = aplay.wait(timeout=10)
+                if rc != 0:
+                    err = b""
+                    if aplay.stderr is not None:
+                        err = aplay.stderr.read()
+                    msg = err.decode("utf-8", errors="ignore").strip() or "no stderr"
+                    raise RuntimeError(f"aplay failed (exit {rc}): {msg}")
+            finally:
+                if aplay.stderr is not None:
+                    aplay.stderr.close()
+                if aplay.poll() is None:
+                    aplay.terminate()
+                    try:
+                        aplay.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        aplay.kill()
 
-        playback_rate = native_rate if use_native_rate else piper_rate
+            if proc.poll() is None:
+                proc.wait(timeout=2)
+            return
+        # --- End aplay path ---
+
+        resolved_output_device = _resolve_output_device(output_device)
+
+        candidate_devices: list[str | int | None] = []
+
+        def _add_candidate(dev: str | int | None) -> None:
+            if dev in candidate_devices:
+                return
+            candidate_devices.append(dev)
+
+        _add_candidate(resolved_output_device)
+
+        try:
+            default_in_out = sd.default.device
+            if isinstance(default_in_out, (list, tuple)) and len(default_in_out) >= 2:
+                default_out = default_in_out[1]
+                if isinstance(default_out, int) and default_out >= 0:
+                    _add_candidate(default_out)
+        except Exception:
+            pass
+
+        try:
+            for idx, dev in enumerate(sd.query_devices()):
+                try:
+                    if int(dev.get("max_output_channels", 0)) > 0:
+                        _add_candidate(idx)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        _add_candidate(None)
 
         assert proc.stdout is not None
-        with sd.RawOutputStream(
-            samplerate=playback_rate,
-            channels=1,
-            dtype="int16",
-            device=output_device,
-            latency="high",
-            blocksize=stream_blocksize,
-        ) as stream:
-            while True:
-                if interrupted_flag and interrupted_flag.is_set():
-                    break
+        last_stream_error: Exception | None = None
+        stream_opened = False
 
-                raw = proc.stdout.read(read_chunk_bytes)
-                if not raw:
-                    break
+        for device_candidate in candidate_devices:
+            native_rate = _resolve_output_device_rate(device_candidate)
+            use_native_rate = False
+            try:
+                sd.check_output_settings(
+                    device=device_candidate,
+                    samplerate=piper_rate,
+                    channels=1,
+                    dtype="int16",
+                )
+            except Exception:
+                use_native_rate = True
 
-                if use_native_rate:
-                    audio = np.frombuffer(raw, dtype=np.int16)
-                    if audio.size == 0:
-                        continue
-                    resampled_samples = max(1, int(len(audio) * (native_rate / piper_rate)))
-                    audio = scipy.signal.resample(audio, resampled_samples).astype(np.int16)
-                    stream.write(audio.tobytes())
-                else:
-                    stream.write(raw)
+            playback_rate = native_rate if use_native_rate else piper_rate
 
-            # Add a short tail pad to avoid clipping the final phoneme.
-            if not (interrupted_flag and interrupted_flag.is_set()):
-                silence_samples = max(0, int(playback_rate * tail_silence_s))
-                if silence_samples > 0:
-                    stream.write(np.zeros(silence_samples, dtype=np.int16).tobytes())
+            try:
+                with sd.RawOutputStream(
+                    samplerate=playback_rate,
+                    channels=1,
+                    dtype="int16",
+                    device=device_candidate,
+                    latency="high",
+                    blocksize=stream_blocksize,
+                ) as stream:
+                    stream_opened = True
+                    if device_candidate is not None:
+                        print(f"[TTS] Using output device: {device_candidate}", flush=True)
+                    else:
+                        print("[TTS] Using system default output device.", flush=True)
+
+                    while True:
+                        if interrupted_flag and interrupted_flag.is_set():
+                            break
+
+                        raw = proc.stdout.read(read_chunk_bytes)
+                        if not raw:
+                            break
+
+                        if use_native_rate:
+                            audio = np.frombuffer(raw, dtype=np.int16)
+                            if audio.size == 0:
+                                continue
+                            resampled_samples = max(1, int(len(audio) * (native_rate / piper_rate)))
+                            audio = scipy.signal.resample(audio, resampled_samples).astype(np.int16)
+                            stream.write(audio.tobytes())
+                        else:
+                            stream.write(raw)
+
+                    if not (interrupted_flag and interrupted_flag.is_set()):
+                        silence_samples = max(0, int(playback_rate * tail_silence_s))
+                        if silence_samples > 0:
+                            stream.write(np.zeros(silence_samples, dtype=np.int16).tobytes())
+                break
+            except Exception as exc:
+                last_stream_error = exc
+                continue
+
+        if not stream_opened:
+            if shutil.which("aplay") is not None:
+                print("[TTS] Falling back to ALSA aplay backend.", flush=True)
+                alsa_device = _find_alsa_device()
+                aplay = subprocess.Popen(
+                    [
+                        "aplay", "-q",
+                        "-D", alsa_device,
+                        "-f", "S32_LE",    # MAX98357A requires S32_LE, not S16_LE
+                        "-r", str(piper_rate),
+                        "-c", "2",         # MAX98357A requires stereo, not mono
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                try:
+                    assert aplay.stdin is not None
+                    bytes_written = 0
+                    try:
+                        while True:
+                            if interrupted_flag and interrupted_flag.is_set():
+                                break
+                            raw = proc.stdout.read(read_chunk_bytes)
+                            if not raw:
+                                break
+                            # Convert S16_LE mono (from Piper) to S32_LE stereo (for MAX98357A)
+                            converted = _convert_s16_to_s32_stereo(raw)
+                            aplay.stdin.write(converted)
+                            aplay.stdin.flush()
+                            bytes_written += len(converted)
+                    except BrokenPipeError as e:
+                        print(f"[TTS] Broken pipe after writing {bytes_written} bytes: {e}", flush=True)
+                        err = b""
+                        if aplay.stderr is not None:
+                            err = aplay.stderr.read()
+                        msg = err.decode("utf-8", errors="ignore").strip()
+                        raise RuntimeError(f"aplay pipe closed: {msg or 'no stderr'}") from e
+                    aplay.stdin.close()
+                    rc = aplay.wait(timeout=5)
+                    if rc != 0:
+                        err = b""
+                        if aplay.stderr is not None:
+                            err = aplay.stderr.read()
+                        msg = err.decode("utf-8", errors="ignore").strip() or "no stderr"
+                        raise RuntimeError(f"aplay failed (exit {rc}): {msg}")
+                finally:
+                    if aplay.stderr is not None:
+                        aplay.stderr.close()
+                    if aplay.poll() is None:
+                        aplay.terminate()
+                        try:
+                            aplay.wait(timeout=1)
+                        except subprocess.TimeoutExpired:
+                            aplay.kill()
+            else:
+                raise RuntimeError(
+                    f"Failed to open any audio output device. Last error: {last_stream_error}"
+                )
 
         if proc.poll() is None:
             proc.wait(timeout=2)

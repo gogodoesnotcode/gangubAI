@@ -1,9 +1,18 @@
 """Interactive CLI entrypoint – GangubAI Chatbot with RAG."""
 
+import json
+import subprocess
+import time
+
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite import SqliteSaver, sqlite3
 
+from ai.frontend.bridge.local_queue import EmotionPublisher
 from ai.chatbot.graph import graph
+
+
+_EMOTION_PUBLISHER = EmotionPublisher()
+_ROS_EMOTION_TOPIC = "/robot_emotion"
 
 
 def main():
@@ -45,6 +54,7 @@ def main():
 
             emotion = (final_state or {}).get("current_emotion", "neutral")
             print(f"\n🎭 Emotion: {emotion}")
+            _emit_emotion(str(emotion), source="chatbot")
             print("=" * 60)
 
         except KeyboardInterrupt:
@@ -53,6 +63,42 @@ def main():
         except Exception as e:
             print(f"\n❌ Error: {e}")
             print("Please try again with a different question.")
+
+
+def _emit_emotion(emotion: str, source: str = "chatbot") -> None:
+    normalized = emotion.strip().lower() or "neutral"
+    _EMOTION_PUBLISHER.publish(normalized, source=source)
+    _publish_emotion_to_ros(normalized, source=source)
+
+
+def _publish_emotion_to_ros(emotion: str, source: str) -> None:
+    message_json = json.dumps(
+        {
+            "emotion": emotion,
+            "source": source,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "payload": "",
+        },
+        ensure_ascii=True,
+    )
+    ros_payload = "{data: '" + message_json + "'}"
+
+    try:
+        subprocess.Popen(
+            [
+                "ros2",
+                "topic",
+                "pub",
+                "--once",
+                _ROS_EMOTION_TOPIC,
+                "std_msgs/msg/String",
+                ros_payload,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return
 
 
 if __name__ == "__main__":

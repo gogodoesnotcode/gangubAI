@@ -1,5 +1,6 @@
 """ROS 2 motor-command tool – lets the chatbot move the robot."""
 
+import re
 from typing import Literal
 
 from langchain_core.tools import tool
@@ -11,6 +12,29 @@ import subprocess
 
 VALID_DIRECTIONS = ("forward", "backward", "left", "right", "stop")
 VALID_WANDER_ACTIONS = ("start", "stop")
+
+
+def _topic_has_subscribers(topic: str) -> bool:
+    """Return True when at least one subscriber exists for *topic*."""
+    try:
+        result = subprocess.run(
+            ["ros2", "topic", "info", topic],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return False
+
+    if result.returncode != 0:
+        return False
+
+    match = re.search(r"Subscription count:\s*(\d+)", result.stdout)
+    if not match:
+        return False
+
+    return int(match.group(1)) > 0
 
 
 def _publish_once(topic: str, message_type: str, payload: str) -> None:
@@ -29,23 +53,62 @@ def _publish_once(topic: str, message_type: str, payload: str) -> None:
 def _publish_motor_command(direction: str, duration: float = 5.0) -> str:
     """Publish a string command to /motor_command and auto-stop after *duration* seconds."""
     try:
-        # Send the movement command
-        _publish_once(
-            topic="/motor_command",
-            message_type="std_msgs/msg/String",
-            payload=f"{{data: '{direction}'}}",
-        )
+        if not _topic_has_subscribers("/motor_command"):
+            return (
+                "Error: No subscribers on /motor_command. "
+                "Start ROS simulation/hardware controller first: "
+                "ros2 launch gangubai_control motor_control.launch.py simulate:=true"
+            )
 
         # If the command is "stop" we're done — no need to schedule another stop
         if direction == "stop":
+            _publish_once(
+                topic="/motor_command",
+                message_type="std_msgs/msg/String",
+                payload="{data: 'stop'}",
+            )
             return f"Robot stopped."
 
-        # Schedule an automatic stop after `duration` seconds
-        # (bash background sleep + ros2 pub)
+        # Keep publishing command while moving to satisfy motor controller
+        # watchdog (cmd timeout is ~0.5s in current node params).
+        duration = max(0.2, float(duration))
+        payload = direction
+        publisher_script = f"""
+import time
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+
+direction = {payload!r}
+duration_s = {duration!r}
+
+
+class PublisherNode(Node):
+    def __init__(self):
+        super().__init__('direct_motor_publisher')
+        self.publisher = self.create_publisher(String, '/motor_command', 10)
+
+    def publish_direction(self, value: str) -> None:
+        message = String()
+        message.data = value
+        self.publisher.publish(message)
+
+
+rclpy.init()
+node = PublisherNode()
+deadline = time.time() + duration_s
+
+try:
+    while time.time() < deadline:
+        node.publish_direction(direction)
+        time.sleep(0.1)
+finally:
+    node.publish_direction('stop')
+    rclpy.shutdown()
+"""
         subprocess.Popen(
-            ["bash", "-c",
-             f"sleep {duration} && ros2 topic pub --once /motor_command "
-             f"std_msgs/msg/String \"{{data: 'stop'}}\""],
+            ["/usr/bin/python3", "-c", publisher_script],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -116,6 +179,12 @@ def set_wander_mode(action: Literal["start", "stop"]) -> str:
         return f"Invalid wander action '{action}'. Use start or stop."
 
     try:
+        if not _topic_has_subscribers("/wander_mode"):
+            return (
+                "Error: No subscribers on /wander_mode. "
+                "Start wander controller via ROS launch first."
+            )
+
         _publish_once(
             topic="/wander_mode",
             message_type="std_msgs/msg/String",

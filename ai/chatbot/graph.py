@@ -14,7 +14,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import BaseModel, Field
 
 from ai.chatbot.config import MODEL_ID, SYSTEM_PROMPT
-from ai.chatbot.tools import calculator, retrieve_context, move_robot, set_wander_mode
+from ai.chatbot.tools import calculator, pomodoro, retrieve_context, move_robot, set_wander_mode, timer
 
 
 # ── Emotion enum ───────────────────────────────────────────
@@ -72,12 +72,14 @@ class RAGResponse(BaseModel):
 
 
 # ── LLM bindings ──────────────────────────────────────────
-tools_list = [calculator, retrieve_context, move_robot, set_wander_mode]
+tools_list = [retrieve_context, move_robot, set_wander_mode, timer, pomodoro]
 # model = init_chat_model(MODEL_ID)
 model = ChatGroq(model="openai/gpt-oss-20b", temperature=0.7)
 llm_with_tools = model.bind_tools(tools_list)
 llm_for_rag = model.with_structured_output(RAGResponse)
 llm_for_chat = model.with_structured_output(ChatResponse)
+
+_TIMER_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b", re.IGNORECASE)
 
 
 def _latest_user_query(messages: list[BaseMessage]) -> str:
@@ -118,21 +120,96 @@ def _looks_like_robot_action_query(user_query: str) -> bool:
     return any(keyword in q for keyword in robot_keywords)
 
 
+def _looks_like_timer_query(user_query: str) -> bool:
+    q = user_query.lower().strip()
+    return any(keyword in q for keyword in ("timer", "countdown", "alarm"))
+
+
+def _looks_like_pomodoro_query(user_query: str) -> bool:
+    q = user_query.lower().strip()
+    return any(keyword in q for keyword in ("pomodoro", "focus session", "study session"))
+
+
+def _extract_timer_duration_seconds(user_query: str) -> float | None:
+    match = _TIMER_PATTERN.search(user_query)
+    if not match:
+        return None
+
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return None
+
+    unit = match.group(2).lower()
+    if unit.startswith("h"):
+        return value * 3600.0
+    if unit.startswith("m"):
+        return value * 60.0
+    return value
+
+
+def _forced_timer_tool_call(duration_seconds: float) -> dict:
+    return {
+        "name": "timer",
+        "args": {"duration_seconds": duration_seconds},
+        "id": f"force_timer_{uuid4().hex}",
+        "type": "tool_call",
+    }
+
+
+def _forced_pomodoro_tool_call() -> dict:
+    return {
+        "name": "pomodoro",
+        "args": {"work_minutes": 25.0, "break_minutes": 5.0, "cycles": 4},
+        "id": f"force_pomodoro_{uuid4().hex}",
+        "type": "tool_call",
+    }
+
+
 def _looks_like_smalltalk_query(user_query: str) -> bool:
     q = user_query.lower().strip()
-    smalltalk_cues = (
-        "joke",
-        "funny",
-        "humor",
+    phrase_cues = (
         "how are you",
         "who are you",
         "your name",
-        "hello",
-        "hi",
-        "thanks",
         "thank you",
     )
-    return any(cue in q for cue in smalltalk_cues)
+    if any(cue in q for cue in phrase_cues):
+        return True
+
+    # Word-boundary checks avoid false positives like "this" matching "hi".
+    return bool(re.search(r"\b(joke|funny|humor|hello|hi|thanks)\b", q))
+
+
+def _infer_robot_direction_and_duration(user_query: str) -> tuple[str, float]:
+    """Infer a motor command from natural-language movement intent."""
+    q = user_query.lower().strip()
+
+    if any(token in q for token in ("360", "spin", "rotate", "turn around")):
+        return "360", 10.0
+    if "forward" in q or "ahead" in q:
+        return "forward", 2.0
+    if any(token in q for token in ("backward", "reverse", "back")):
+        return "backward", 2.0
+    if "left" in q:
+        return "left", 2.0
+    if "right" in q:
+        return "right", 2.0
+    if "stop" in q:
+        return "stop", 0.0
+
+    # Generic move/turn fallback
+    return "forward", 2.0
+
+
+def _forced_move_tool_call(user_query: str) -> dict:
+    direction, duration = _infer_robot_direction_and_duration(user_query)
+    return {
+        "name": "move_robot",
+        "args": {"direction": direction, "duration": duration},
+        "id": f"force_move_{uuid4().hex}",
+        "type": "tool_call",
+    }
 
 
 def _should_force_retrieve(user_query: str) -> bool:
@@ -148,9 +225,20 @@ def _should_force_retrieve(user_query: str) -> bool:
     ):
         return False
 
-    # Keep this intentionally strict. We only force retrieval when the
-    # user is clearly asking for instructional/knowledge-grounded content.
+    # Knowledge/teaching intent should prefer retrieval-first behavior.
     retrieval_cues = (
+        "teach",
+        "explain",
+        "detail",
+        "in detail",
+        "what is",
+        "how does",
+        "why",
+        "history",
+        "evolution",
+        "llm",
+        "transformer",
+        "nlp",
         "slides",
         "notes",
         "ppt",
@@ -178,7 +266,15 @@ def chatNode(state: ChatState) -> ChatState:
 
     # Small-talk should stay conversational and not hit retrieval tools.
     if _looks_like_smalltalk_query(latest_user_query):
-        response: ChatResponse = llm_for_chat.invoke(all_messages)
+        try:
+            response: ChatResponse = llm_for_chat.invoke(all_messages)
+        except Exception:
+            fallback_msg = model.invoke(all_messages)
+            fallback_text = str(getattr(fallback_msg, "content", "")).strip() or "Hey there!"
+            return {
+                "messages": [AIMessage(content=fallback_text)],
+                "current_emotion": Emotion.NEUTRAL.value,
+            }
         return {
             "messages": [AIMessage(content=response.content)],
             "current_emotion": response.emotion,
@@ -217,17 +313,84 @@ def chatNode(state: ChatState) -> ChatState:
                 )
             ),
         ]
-        response: RAGResponse = llm_for_rag.invoke(rag_messages)
+        try:
+            response: RAGResponse = llm_for_rag.invoke(rag_messages)
+        except Exception:
+            fallback_msg = model.invoke(rag_messages)
+            fallback_text = str(getattr(fallback_msg, "content", "")).strip()
+            if not fallback_text:
+                fallback_text = "I found relevant context, but had trouble formatting the response."
+            return {
+                "messages": [AIMessage(content=fallback_text)],
+                "current_emotion": Emotion.THINKING.value,
+            }
         formatted = f"{response.explanation}\n\n {response.citation}"
         return {
             "messages": [AIMessage(content=formatted)],
             "current_emotion": response.emotion,
         }
 
-    # If the LLM decides to call a tool, fall through to the tool-calling path
-    tool_response = llm_with_tools.invoke(all_messages)
+    # If the LLM decides to call a tool, fall through to the tool-calling path.
+    # Some provider/model combinations occasionally reject tool metadata despite
+    # bind_tools(); in that case we force retrieval for knowledge prompts.
+    try:
+        tool_response = llm_with_tools.invoke(all_messages)
+    except Exception as exc:
+        err = str(exc).lower()
+        if (
+            "tool call validation failed" in err
+            or "not in request.tools" in err
+            or "output_parse_failed" in err
+            or "parsing failed" in err
+        ) and _looks_like_robot_action_query(latest_user_query):
+            return {
+                "messages": [AIMessage(content="", tool_calls=[_forced_move_tool_call(latest_user_query)])],
+                "current_emotion": Emotion.EXCITED.value,
+            }
+        if (
+            "tool call validation failed" in err
+            or "not in request.tools" in err
+        ) and _should_force_retrieve(latest_user_query):
+            forced_tool_call = {
+                "name": "retrieve_context",
+                "args": {"query": latest_user_query},
+                "id": f"force_retrieve_{uuid4().hex}",
+                "type": "tool_call",
+            }
+            return {
+                "messages": [AIMessage(content="", tool_calls=[forced_tool_call])],
+                "current_emotion": Emotion.THINKING.value,
+            }
+        raise
+
     if tool_response.tool_calls:
         return {"messages": [tool_response]}
+
+    if _looks_like_timer_query(latest_user_query):
+        duration_seconds = _extract_timer_duration_seconds(latest_user_query)
+        if duration_seconds is None:
+            return {
+                "messages": [AIMessage(content="How long should I set the timer for?")],
+                "current_emotion": Emotion.CURIOUS.value,
+            }
+        return {
+            "messages": [AIMessage(content="", tool_calls=[_forced_timer_tool_call(duration_seconds)])],
+            "current_emotion": Emotion.HAPPY.value,
+        }
+
+    if _looks_like_pomodoro_query(latest_user_query):
+        return {
+            "messages": [AIMessage(content="", tool_calls=[_forced_pomodoro_tool_call()])],
+            "current_emotion": Emotion.HAPPY.value,
+        }
+
+    # If movement intent was detected but no tool call was emitted,
+    # force one so physical/sim motion actually happens.
+    if _looks_like_robot_action_query(latest_user_query):
+        return {
+            "messages": [AIMessage(content="", tool_calls=[_forced_move_tool_call(latest_user_query)])],
+            "current_emotion": Emotion.EXCITED.value,
+        }
 
     # Gemini occasionally returns "I'll look it up" style text without
     # actually emitting a tool call. Force a real retrieve_context call so
@@ -245,7 +408,15 @@ def chatNode(state: ChatState) -> ChatState:
         }
 
     # No tool calls → get a structured response with emotion
-    response: ChatResponse = llm_for_chat.invoke(all_messages)
+    try:
+        response: ChatResponse = llm_for_chat.invoke(all_messages)
+    except Exception:
+        fallback_msg = model.invoke(all_messages)
+        fallback_text = str(getattr(fallback_msg, "content", "")).strip() or "I am here."
+        return {
+            "messages": [AIMessage(content=fallback_text)],
+            "current_emotion": Emotion.NEUTRAL.value,
+        }
     return {
         "messages": [AIMessage(content=response.content)],
         "current_emotion": response.emotion,
