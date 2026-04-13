@@ -33,6 +33,7 @@ __pycache__/
 *.wav
 *.mp3
 *.flac
+*.log
 
 # Local notebooks / scratch files
 *.ipynb
@@ -48,6 +49,9 @@ whisper.cpp/
 ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
+/build/
+/install/
+/log/
 
 # ROS 2 Python package caches
 ros2_ws/src/**/__pycache__/
