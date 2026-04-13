@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'motor_controller = gangubai_control.motor_controller_node:main',
+            'wander_controller = gangubai_control.wander_controller_node:main',
         ],
     },
 )

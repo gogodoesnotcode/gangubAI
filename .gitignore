@@ -1,24 +1,58 @@
 # Environment files
 .env
+.env.*
 
-# Database files
+# Python virtual environments
+venv/
+.venv/
+
+# Python cache / build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Database and local state
 *.db
 *.sqlite
 *.sqlite3
 *.mdb
-
-# Checkpoint files
-*.ckpt
-.langgraph_api/
-venv/
-gangubai_chatbot.ipynb
-simple_rag.py
 .gangubai_db_hf/
+.langgraph_api/
 
-__pycache__/
-*.pyc
+# Model and checkpoint artifacts
+*.ckpt
+*.onnx
+
+# Audio / recording artifacts
+*.wav
+*.mp3
+*.flac
+*.log
+
+# Local notebooks / scratch files
+*.ipynb
+simple_rag.py
+
+# Keep project source code only: ignore vendored runtimes and model repos
+piper/
+scripts/
+wakeword_models/
+whisper.cpp/
 
 # ROS 2 build artifacts
 ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
+/build/
+/install/
+/log/
+
+# ROS 2 Python package caches
+ros2_ws/src/**/__pycache__/
+ros2_ws/src/**/*.pyc

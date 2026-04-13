@@ -131,9 +131,9 @@
     </ray>
     <plugin name="cliff_sensor_plugin" filename="libgazebo_ros_ray_sensor.so">
       <ros>
-        <remapping>~/out:=cliff_data</remapping>
+        <remapping>~/out:=cliff_scan</remapping>
       </ros>
-      <output_type>sensor_msgs/Range</output_type>
+      <output_type>sensor_msgs/LaserScan</output_type>
       <frame_name>ir_sensor_front</frame_name>
     </plugin>
   </sensor>

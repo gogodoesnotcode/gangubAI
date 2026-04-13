@@ -22,15 +22,135 @@ L298N wiring (default GPIO pins, configurable via ROS params):
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan, Range
 from std_msgs.msg import String
+import os
+from pathlib import Path
 
-# Try importing RPi.GPIO — falls back to a stub for desktop development/testing
-try:
-    import RPi.GPIO as GPIO
-    GPIO_AVAILABLE = True
-except (ImportError, RuntimeError):
-    GPIO_AVAILABLE = False
+# Prefer lgpio on Pi 5, fall back to RPi.GPIO on older boards/images.
+GPIO_BACKEND = None
+GPIO = None
+GPIO_AVAILABLE = False
+
+
+def _gpiochip_candidates():
+    detected = []
+
+    override = os.environ.get('GANGUBAI_GPIOCHIP', '').strip()
+    if override:
+        try:
+            detected.append(int(override))
+        except ValueError:
+            pass
+
+    for chip_path in sorted(Path('/dev').glob('gpiochip*')):
+        suffix = chip_path.name.removeprefix('gpiochip')
+        if suffix.isdigit():
+            detected.append(int(suffix))
+
+    candidates = []
+    candidates.extend(detected)
+    candidates.extend(range(32))
+
+    ordered = []
+    seen = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            ordered.append(candidate)
+    return ordered
+
+
+def _open_gpiochip(lgpio_module):
+    last_error = None
+    tried = _gpiochip_candidates()
+    for chip_index in tried:
+        try:
+            return lgpio_module.gpiochip_open(chip_index), chip_index
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        'Unable to open any gpiochip device. '
+        f'Candidates tried: {tried}. '
+        f'Last error: {last_error}'
+    )
+
+
+def _init_gpio_backend():
+    global GPIO_BACKEND
+    import sys
+    
+    try:
+        import lgpio as _lgpio
+
+        class _LgpioPWM:
+            def __init__(self, handle: int, pin: int, freq: int):
+                self._handle = handle
+                self._pin = pin
+                self._freq = freq
+
+            def start(self, duty_cycle: float):
+                self.ChangeDutyCycle(duty_cycle)
+
+            def ChangeDutyCycle(self, duty_cycle: float):
+                duty = max(0.0, min(100.0, float(duty_cycle)))
+                _lgpio.tx_pwm(self._handle, self._pin, self._freq, duty)
+
+            def stop(self):
+                _lgpio.tx_pwm(self._handle, self._pin, 0, 0.0)
+
+        class _LgpioCompat:
+            BCM = 'BCM'
+            OUT = 'OUT'
+            HIGH = 1
+            LOW = 0
+
+            def __init__(self):
+                self._chip, self._chip_index = _open_gpiochip(_lgpio)
+                self._claimed = set()
+
+            def setmode(self, _mode):
+                return
+
+            def setwarnings(self, _flag):
+                return
+
+            def setup(self, pin: int, _mode):
+                if pin not in self._claimed:
+                    _lgpio.gpio_claim_output(self._chip, pin, 0)
+                    self._claimed.add(pin)
+
+            def output(self, pin: int, value: int):
+                _lgpio.gpio_write(self._chip, pin, 1 if value else 0)
+
+            def PWM(self, pin: int, freq: int):
+                return _LgpioPWM(self._chip, pin, freq)
+
+            def cleanup(self):
+                try:
+                    _lgpio.gpiochip_close(self._chip)
+                except Exception:
+                    pass
+
+        GPIO_BACKEND = 'lgpio'
+        return _LgpioCompat(), True
+    except Exception as exc:
+        print(f'[GPIO backend init]: lgpio failed: {exc}', file=sys.stderr)
+        pass
+
+    try:
+        import RPi.GPIO as _rpi_gpio
+        GPIO_BACKEND = 'RPi.GPIO'
+        return _rpi_gpio, True
+    except Exception as exc:
+        print(f'[GPIO backend init]: RPi.GPIO failed: {exc}', file=sys.stderr)
+        GPIO_BACKEND = None
+        return None, False
+
+
+GPIO, GPIO_AVAILABLE = _init_gpio_backend()
 
 
 class MotorControllerNode(Node):
@@ -39,6 +159,13 @@ class MotorControllerNode(Node):
     def __init__(self):
         super().__init__('motor_controller')
 
+        # ── Early validation: GPIO backend must be available ──────────────
+        if not GPIO_AVAILABLE or not GPIO:
+            self.get_logger().error(
+                'GPIO backend unavailable. Neither lgpio nor RPi.GPIO could initialize. '
+                'Check permissions and /dev/gpiochip* access. Forcing simulation mode.'
+            )
+        
         # ── Declare parameters (all configurable at launch) ──────────────
         self.declare_parameter('ena_pin', 12)   # PWM pin for left motor
         self.declare_parameter('in1_pin', 23)
@@ -52,8 +179,13 @@ class MotorControllerNode(Node):
         self.declare_parameter('linear_scale', 0.3)        # m/s per 100% speed (for sim Twist)
         self.declare_parameter('angular_scale', 1.0)       # rad/s per 100% speed (for sim Twist)
         self.declare_parameter('cmd_vel_timeout', 0.5)     # seconds without cmd_vel → stop
-        self.declare_parameter('simulate', not GPIO_AVAILABLE)  # force simulation mode
+        self.declare_parameter('simulate', not (GPIO_AVAILABLE and GPIO))  # force simulation if GPIO unavailable
         self.declare_parameter('demo', False)                   # run a demo sequence on startup
+        self.declare_parameter('cliff_topic', 'cliff_scan')
+        self.declare_parameter('cliff_message_type', 'scan')
+        self.declare_parameter('cliff_edge_distance_m', 0.14)
+        self.declare_parameter('cliff_topic_timeout_s', 1.0)
+        self.declare_parameter('enable_cliff_safety', self.get_parameter('simulate').value)
 
         # Read parameters
         self.ena_pin = self.get_parameter('ena_pin').value
@@ -70,6 +202,11 @@ class MotorControllerNode(Node):
         self.cmd_vel_timeout = self.get_parameter('cmd_vel_timeout').value
         self.simulate = self.get_parameter('simulate').value
         self.demo = self.get_parameter('demo').value
+        self.cliff_topic = str(self.get_parameter('cliff_topic').value)
+        self.cliff_message_type = str(self.get_parameter('cliff_message_type').value).strip().lower()
+        self.cliff_edge_distance_m = float(self.get_parameter('cliff_edge_distance_m').value)
+        self.cliff_topic_timeout_s = float(self.get_parameter('cliff_topic_timeout_s').value)
+        self.enable_cliff_safety = bool(self.get_parameter('enable_cliff_safety').value)
 
         # ── GPIO setup (hardware mode only) ──────────────────────────────
         if not self.simulate:
@@ -88,6 +225,20 @@ class MotorControllerNode(Node):
 
         self.create_subscription(String, 'motor_command', self._motor_command_cb, 10)
 
+        self.cliff_sub = None
+        self._last_cliff_time = None
+        self._last_cliff_range = None
+        self._last_cliff_max = None
+        if self.enable_cliff_safety:
+            if self.cliff_message_type in ('scan', 'laserscan', 'laser_scan'):
+                self.cliff_sub = self.create_subscription(
+                    LaserScan, self.cliff_topic, self._cliff_scan_cb, qos_profile_sensor_data
+                )
+            else:
+                self.cliff_sub = self.create_subscription(
+                    Range, self.cliff_topic, self._cliff_cb, qos_profile_sensor_data
+                )
+
         # ── Status publisher ─────────────────────────────────────────────
         self.status_pub = self.create_publisher(String, 'motor_status', 10)
 
@@ -96,7 +247,10 @@ class MotorControllerNode(Node):
         self._watchdog_timer = self.create_timer(0.1, self._watchdog_cb)
         self._stopped = True
 
-        mode = 'SIMULATION (Gazebo)' if self.simulate else 'HARDWARE (RPi.GPIO)'
+        backend = GPIO_BACKEND or 'none'
+        chip_index = getattr(GPIO, '_chip_index', None) if GPIO is not None else None
+        backend_note = backend if chip_index is None else f'{backend} (chip {chip_index})'
+        mode = 'SIMULATION (Gazebo)' if self.simulate else f'HARDWARE ({backend_note})'
         self.get_logger().info(
             f'Motor controller started in {mode} mode'
         )
@@ -122,6 +276,61 @@ class MotorControllerNode(Node):
             self.get_logger().info('═' * 50)
             self._start_demo_step()
             self._demo_timer = self.create_timer(0.1, self._demo_tick_cb)
+
+    def _as_bool(self, value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ('1', 'true', 'yes', 'on')
+        return bool(value)
+
+    def _has_fresh_cliff(self) -> bool:
+        if self._last_cliff_time is None:
+            return False
+        elapsed = (self.get_clock().now() - self._last_cliff_time).nanoseconds / 1e9
+        return elapsed <= self.cliff_topic_timeout_s
+
+    def _is_edge_detected(self) -> bool:
+        if self._last_cliff_range is None:
+            return False
+        return self._last_cliff_range >= self.cliff_edge_distance_m
+
+    def _cliff_cb(self, msg: Range):
+        self._last_cliff_time = self.get_clock().now()
+        self._last_cliff_range = float(msg.range)
+        self._last_cliff_max = float(msg.max_range) if msg.max_range > 0.0 else None
+
+    def _cliff_scan_cb(self, msg: LaserScan):
+        if not msg.ranges:
+            self._last_cliff_time = self.get_clock().now()
+            self._last_cliff_range = None
+            self._last_cliff_max = None
+            return
+
+        finite_ranges = [reading for reading in msg.ranges if reading == reading]
+        if not finite_ranges:
+            self._last_cliff_time = self.get_clock().now()
+            self._last_cliff_range = None
+            self._last_cliff_max = None
+            return
+
+        self._last_cliff_time = self.get_clock().now()
+        self._last_cliff_range = float(min(finite_ranges))
+        self._last_cliff_max = float(msg.range_max) if msg.range_max > 0.0 else None
+
+    def _cliff_blocks_forward(self) -> bool:
+        if not self.enable_cliff_safety:
+            return False
+
+        if not self._has_fresh_cliff():
+            self.get_logger().warn('Cliff safety active but no fresh cliff data; blocking forward motion.')
+            return True
+
+        if self._is_edge_detected():
+            self.get_logger().warn('Cliff detected; blocking forward motion.')
+            return True
+
+        return False
 
     # ═══════════════════════════════════════════════════════════════════
     # GPIO helpers
@@ -242,6 +451,10 @@ class MotorControllerNode(Node):
         speed = self.default_speed
 
         if command == 'forward':
+            if self._cliff_blocks_forward():
+                self._stop_motors()
+                self.get_logger().info('■ Command: STOP (cliff safety)')
+                return
             self._set_motors(speed, speed)
             self.get_logger().info('▶ Command: FORWARD')
         elif command == 'backward':
@@ -298,6 +511,11 @@ class MotorControllerNode(Node):
             command = self._demo_steps[self._demo_index][0].lower()
             speed = self.default_speed
             if command == 'forward':
+                if self._cliff_blocks_forward():
+                    self._stop_motors()
+                    self._demo_timer.cancel()
+                    self.get_logger().warn('Demo paused by cliff safety.')
+                    return
                 self._set_motors(speed, speed)
             elif command == 'backward':
                 self._set_motors(-speed, -speed)
